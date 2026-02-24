@@ -160,10 +160,6 @@ static u64 user_sched_budget_ns;
  */
 static int user_sched_active_users;
 
-/* Debug counters (readable via dmesg) */
-static atomic64_t user_sched_dbg_throttle = ATOMIC64_INIT(0);
-static atomic64_t user_sched_dbg_wakeup   = ATOMIC64_INIT(0);
-static atomic64_t user_sched_dbg_epoch    = ATOMIC64_INIT(0);
 
 static struct user_sched_info *user_sched_find(uid_t uid)
 {
@@ -7136,7 +7132,6 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		return;
 	}
 
-	/* (scarcity tracked via per-epoch runnable count in epoch callback) */
 
 	/*
 	 * If in_iowait is set, the code below may not trigger any cpufreq
@@ -7381,7 +7376,6 @@ out:
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
-	/* (scarcity tracked via per-epoch runnable count in epoch callback) */
 
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & DEQUEUE_SAVE))))
 		util_est_dequeue(&rq->cfs, p);
@@ -13311,10 +13305,8 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 	int active_users = 0; /* users with non-trivial CPU use this epoch */
 	u64 total_epoch = 0;
 	u64 new_budget = 0;
-	u64 epoch_num;
 
 	n = atomic_read(&user_sched_nr);
-	epoch_num = atomic64_inc_return(&user_sched_dbg_epoch);
 
 	/*
 	 * Step 1: count users that were active this epoch and total CPU used.
@@ -13336,12 +13328,7 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 
 	/* Capture per-user epoch_ns for debug BEFORE resetting */
 	{
-		u64 epoch_ns_snapshot[USER_SCHED_MAX_USERS];
 		int wanting_cpu = 0; /* tasks on-rq OR throttled by us */
-
-		for (i = 0; i < n; i++)
-			epoch_ns_snapshot[i] =
-				(u64)atomic64_read(&user_sched_table[i].epoch_ns);
 
 		/* Reset per-epoch counters */
 		for (i = 0; i < n; i++)
@@ -13375,8 +13362,7 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 				   user_sched_find(uid)) {
 				/* throttled by us — still wants CPU */
 				wanting_cpu++;
-				if (wake_up_process(p))
-					atomic64_inc(&user_sched_dbg_wakeup);
+				wake_up_process(p);
 			}
 		}
 		rcu_read_unlock();
@@ -13393,37 +13379,6 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 			WRITE_ONCE(user_sched_active_users, 0);
 		}
 
-		/*
-		 * Debug: print every 10 epochs (~1 s), AND always print on
-		 * active_users transitions so we can see exactly when
-		 * enforcement turns on/off and what the initial budget is.
-		 */
-		{
-			static int prev_active_users;
-			int transition = (active_users != prev_active_users);
-
-			if (transition)
-				prev_active_users = active_users;
-
-			if (n > 0 && (transition || epoch_num % 10 == 0)) {
-				printk(KERN_DEBUG
-					"user_sched: n=%d active=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%llu%s\n",
-					n, active_users,
-					(unsigned long long)new_budget / 1000000ULL,
-					(long long)atomic64_read(&user_sched_dbg_throttle),
-					(long long)atomic64_read(&user_sched_dbg_wakeup),
-					(unsigned long long)epoch_num,
-					transition ? " [TRANSITION]" : "");
-				for (i = 0; i < n; i++)
-					/* prefix user_sched_u so dmesg grep catches it */
-					printk(KERN_DEBUG
-						"user_sched_u: uid=%-6u cpu_time_ms=%lld epoch_ns_ms=%llu\n",
-						user_sched_table[i].uid,
-						(long long)atomic64_read(&user_sched_table[i].cpu_ns)
-							/ 1000000LL,
-						epoch_ns_snapshot[i] / 1000000ULL);
-			}
-		}
 	}
 
 	hrtimer_forward_now(timer, ns_to_ktime(USER_SCHED_EPOCH_NS));
@@ -13480,14 +13435,6 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 
 				if (budget > 0 &&
 				    atomic64_read(&uinfo->epoch_ns) > (s64)budget) {
-					atomic64_inc(&user_sched_dbg_throttle);
-					printk_ratelimited(KERN_DEBUG
-						"user_sched_throttle: uid=%u active=%d runnable_last_epoch=%d budget_ms=%llu epoch_ns=%lld\n",
-						uid,
-						READ_ONCE(user_sched_active_users),
-						num_online_cpus(),
-						(unsigned long long)budget / 1000000ULL,
-						(long long)atomic64_read(&uinfo->epoch_ns));
 					__set_current_state(TASK_INTERRUPTIBLE);
 					resched_curr(rq);
 				}
