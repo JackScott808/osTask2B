@@ -1,0 +1,91 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  TEST 2: Fairness — 4 tasks vs 1 task (equal per-user CPU expected)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[   76.079753] user_sched_dbg: 2 user(s) tracked
+[   76.079930]   uid=1002    cpu_time=11531 ms
+[   76.080031]   uid=1003    cpu_time=12001 ms
+[   76.080120]   preempt_triggered=0  blk_h_nr=23200  blk_n=45  adj=14
+[   77.086363] user_sched_dbg: 2 user(s) tracked
+[   77.086499]   uid=1002    cpu_time=14566 ms
+[   77.086565]   uid=1003    cpu_time=12717 ms
+[   77.086628]   preempt_triggered=0  blk_h_nr=25565  blk_n=45  adj=26
+[   78.091419] user_sched_dbg: 2 user(s) tracked
+[   78.091561]   uid=1002    cpu_time=17319 ms
+[   78.091632]   uid=1003    cpu_time=13559 ms
+[   78.091693]   preempt_triggered=0  blk_h_nr=27750  blk_n=45  adj=38
+[   79.095952] user_sched_dbg: 2 user(s) tracked
+[   79.096072]   uid=1002    cpu_time=20332 ms
+[   79.096142]   uid=1003    cpu_time=14562 ms
+[   79.096198]   preempt_triggered=0  blk_h_nr=30751  blk_n=45  adj=53
+[   80.101047] user_sched_dbg: 2 user(s) tracked
+[   80.101179]   uid=1002    cpu_time=23347 ms
+[   80.101242]   uid=1003    cpu_time=15561 ms
+[   80.101299]   preempt_triggered=0  blk_h_nr=33750  blk_n=45  adj=69
+[   81.104760] user_sched_dbg: 2 user(s) tracked
+[   81.104904]   uid=1002    cpu_time=26358 ms
+[   81.104969]   uid=1003    cpu_time=16562 ms
+[   81.105029]   preempt_triggered=0  blk_h_nr=36752  blk_n=45  adj=85
+[   82.109130] user_sched_dbg: 2 user(s) tracked
+[   82.109252]   uid=1002    cpu_time=29369 ms
+[   82.109316]   uid=1003    cpu_time=17564 ms
+[   82.109362]   preempt_triggered=0  blk_h_nr=39753  blk_n=45  adj=99
+[   83.112216] user_sched_dbg: 2 user(s) tracked
+[   83.112381]   uid=1002    cpu_time=32377 ms
+[   83.112457]   uid=1003    cpu_time=18561 ms
+[   83.112540]   preempt_triggered=0  blk_h_nr=42749  blk_n=45  adj=111
+[   84.116009] user_sched_dbg: 2 user(s) tracked
+[   84.116135]   uid=1002    cpu_time=35388 ms
+[   84.116203]   uid=1003    cpu_time=19563 ms
+[   84.116250]   preempt_triggered=0  blk_h_nr=45753  blk_n=45  adj=126
+[   85.118599] user_sched_dbg: 2 user(s) tracked
+[   85.118724]   uid=1002    cpu_time=38396 ms
+[   85.118816]   uid=1003    cpu_time=20564 ms
+[   85.118906]   preempt_triggered=0  blk_h_nr=48756  blk_n=45  adj=144
+[   86.120987] user_sched_dbg: 2 user(s) tracked
+[   86.121109]   uid=1002    cpu_time=41402 ms
+[   86.121181]   uid=1003    cpu_time=21561 ms
+[   86.121269]   preempt_triggered=0  blk_h_nr=51757  blk_n=45  adj=157
+[   87.124198] user_sched_dbg: 2 user(s) tracked
+[   87.124354]   uid=1002    cpu_time=44411 ms
+[   87.124442]   uid=1003    cpu_time=22561 ms
+[   87.124529]   preempt_triggered=0  blk_h_nr=54758  blk_n=45  adj=169
+[   88.127253] user_sched_dbg: 2 user(s) tracked
+[   88.127420]   uid=1002    cpu_time=47419 ms
+[   88.127510]   uid=1003    cpu_time=23562 ms
+[   88.127597]   preempt_triggered=0  blk_h_nr=57762  blk_n=45  adj=184
+[   89.129200] user_sched_dbg: 2 user(s) tracked
+[   89.129364]   uid=1002    cpu_time=50425 ms
+[   89.129435]   uid=1003    cpu_time=24559 ms
+[   89.129515]   preempt_triggered=0  blk_h_nr=60759  blk_n=45  adj=198
+[   90.130995] user_sched_dbg: 2 user(s) tracked
+[   90.131148]   uid=1002    cpu_time=53429 ms
+[   90.131241]   uid=1003    cpu_time=25559 ms
+[   90.131315]   preempt_triggered=0  blk_h_nr=63762  blk_n=45  adj=214
+[   91.132726] user_sched_dbg: 2 user(s) tracked
+[   91.132879]   uid=1002    cpu_time=56434 ms
+[   91.132966]   uid=1003    cpu_time=26559 ms
+[   91.133052]   preempt_triggered=0  blk_h_nr=66763  blk_n=45  adj=228
+[   92.134352] user_sched_dbg: 2 user(s) tracked
+[   92.134507]   uid=1002    cpu_time=59438 ms
+[   92.134600]   uid=1003    cpu_time=27555 ms
+[   92.134683]   preempt_triggered=0  blk_h_nr=69757  blk_n=45  adj=239
+[   93.136897] user_sched_dbg: 2 user(s) tracked
+[   93.137038]   uid=1002    cpu_time=62353 ms
+[   93.137118]   uid=1003    cpu_time=28553 ms
+[   93.137199]   preempt_triggered=0  blk_h_nr=72440  blk_n=45  adj=252
+[   94.138355] user_sched_dbg: 2 user(s) tracked
+[   94.138512]   uid=1002    cpu_time=65061 ms
+[   94.138564]   uid=1003    cpu_time=29373 ms
+[   94.138621]   preempt_triggered=0  blk_h_nr=74422  blk_n=45  adj=257
+Killed
+Killed
+Killed
+Killed
+[   95.139761] user_sched_dbg: 2 user(s) tracked
+[   95.139882]   uid=1002    cpu_time=66016 ms
+[   95.139979]   uid=1003    cpu_time=30368 ms
+[   95.140049]   preempt_triggered=0  blk_h_nr=75794  blk_n=45  adj=264
+Killed
+[INFO] testuser1 (4 tasks): 49080ms  testuser2 (1 task): 16330ms
+[FAIL] TEST 2 (4v1 fairness, 1:1 expected): ratio=300% outside [65%,154%] (49080ms vs 16330ms)
+
