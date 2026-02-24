@@ -88,6 +88,9 @@
 #include "sched.h"
 #include "stats.h"
 
+/* Declared in fair.c; used in __schedule() for per-user throttling */
+extern bool user_sched_should_sleep(struct task_struct *p);
+
 #include "autogroup.h"
 #include "pelt.h"
 #include "smp.h"
@@ -6669,7 +6672,9 @@ static void __sched notrace __schedule(int sched_mode)
 			next = prev;
 			goto picked;
 		}
-	} else if (!preempt && prev_state) {
+	} else if ((!preempt ||
+		    (prev_state == TASK_INTERRUPTIBLE &&
+		     user_sched_should_sleep(prev))) && prev_state) {
 		try_to_block_task(rq, prev, &prev_state);
 		switch_count = &prev->nvcsw;
 	}
