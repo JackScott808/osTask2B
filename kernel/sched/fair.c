@@ -7140,8 +7140,13 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	if (!task_on_rq_migrating(p)) {
 		uid_t _uid = __kuid_val(task_uid(p));
 
-		if (_uid >= USER_SCHED_MIN_UID)
-			atomic_inc(&user_sched_total_tasks);
+		if (_uid >= USER_SCHED_MIN_UID) {
+			int new_val = atomic_inc_return(&user_sched_total_tasks);
+
+			printk_ratelimited(KERN_DEBUG
+				"user_sched_enqueue: uid=%u total_tasks=%d flags=0x%x\n",
+				_uid, new_val, flags);
+		}
 	}
 
 	/*
@@ -7388,11 +7393,22 @@ out:
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
 	/* Track runnable UID >= 1000 task count for scarcity detection */
-	if (!task_on_rq_migrating(p) && (flags & DEQUEUE_SLEEP)) {
+	{
 		uid_t _uid = __kuid_val(task_uid(p));
 
-		if (_uid >= USER_SCHED_MIN_UID)
-			atomic_dec(&user_sched_total_tasks);
+		if (_uid >= USER_SCHED_MIN_UID && !task_on_rq_migrating(p)) {
+			if (flags & DEQUEUE_SLEEP) {
+				int new_val = atomic_dec_return(&user_sched_total_tasks);
+
+				printk_ratelimited(KERN_DEBUG
+					"user_sched_dequeue_sleep: uid=%u total_tasks=%d flags=0x%x\n",
+					_uid, new_val, flags);
+			} else {
+				printk_ratelimited(KERN_DEBUG
+					"user_sched_dequeue_nosleep: uid=%u total_tasks=%d flags=0x%x (NOT decremented)\n",
+					_uid, atomic_read(&user_sched_total_tasks), flags);
+			}
+		}
 	}
 
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & DEQUEUE_SAVE))))
@@ -13324,17 +13340,23 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 	n = atomic_read(&user_sched_nr);
 	atomic64_inc(&user_sched_dbg_epoch);
 
-	/* Emit debug info every 10 epochs (~1 s) to dmesg ring buffer only */
-	if (n > 0 && (atomic64_read(&user_sched_dbg_epoch) % 10 == 0)) {
-		printk(KERN_DEBUG "user_sched_dbg: %d user(s) throttle=%lld wakeup=%lld epoch=%lld\n",
-		       n,
+	/* Emit debug info every epoch to dmesg ring buffer only */
+	{
+		u64 dbg_budget = READ_ONCE(user_sched_budget_ns);
+		int dbg_total  = atomic_read(&user_sched_total_tasks);
+		int dbg_ncpus  = num_online_cpus();
+
+		printk(KERN_DEBUG "user_sched_epoch: n=%d total_tasks=%d ncpus=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%lld\n",
+		       n, dbg_total, dbg_ncpus,
+		       (unsigned long long)dbg_budget / 1000000ULL,
 		       (long long)atomic64_read(&user_sched_dbg_throttle),
 		       (long long)atomic64_read(&user_sched_dbg_wakeup),
 		       (long long)atomic64_read(&user_sched_dbg_epoch));
 		for (i = 0; i < n; i++) {
-			printk(KERN_DEBUG "  uid=%-6u  cpu_time=%lld ms\n",
+			printk(KERN_DEBUG "  uid=%-6u  cpu_time=%lld ms  epoch_ns=%lld\n",
 			       user_sched_table[i].uid,
-			       (long long)atomic64_read(&user_sched_table[i].cpu_ns) / 1000000LL);
+			       (long long)atomic64_read(&user_sched_table[i].cpu_ns) / 1000000LL,
+			       (long long)atomic64_read(&user_sched_table[i].epoch_ns));
 		}
 	}
 
@@ -13425,6 +13447,14 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 				if (budget > 0 &&
 				    atomic64_read(&uinfo->epoch_ns) > (s64)budget) {
 					atomic64_inc(&user_sched_dbg_throttle);
+					printk_ratelimited(KERN_DEBUG
+						"user_sched_throttle: uid=%u nr=%d total_tasks=%d ncpus=%d budget_ms=%llu epoch_ns=%lld\n",
+						uid,
+						atomic_read(&user_sched_nr),
+						atomic_read(&user_sched_total_tasks),
+						num_online_cpus(),
+						(unsigned long long)budget / 1000000ULL,
+						(long long)atomic64_read(&uinfo->epoch_ns));
 					__set_current_state(TASK_INTERRUPTIBLE);
 					resched_curr(rq);
 				}
