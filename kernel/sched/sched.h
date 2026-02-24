@@ -3130,6 +3130,9 @@ extern struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq);
 extern struct sched_entity *__pick_first_entity(struct cfs_rq *cfs_rq);
 extern struct sched_entity *__pick_last_entity(struct cfs_rq *cfs_rq);
 
+/* fair.c: per-user equitable scheduling — used in core.c __schedule() */
+extern bool user_sched_should_sleep(struct task_struct *p);
+
 #ifdef	CONFIG_SCHED_DEBUG
 extern bool sched_debug_verbose;
 
