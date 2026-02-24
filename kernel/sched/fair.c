@@ -13330,27 +13330,14 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 		}
 	}
 
-	/*
-	 * Step 2: adaptive budget = total CPU / active users.
-	 * This converges so each active user's CPU time equals the budget.
-	 *
-	 * No separate scarcity check needed: if tasks == CPUs and users get
-	 * equal time, each user's epoch_ns == budget and the strictly-greater
-	 * throttle condition never fires naturally.  The check is simply
-	 * "were at least two users actually using CPU?"
-	 */
-	if (active_users >= 2) {
+	/* Step 2: adaptive budget = total CPU / active users. */
+	if (active_users >= 2)
 		new_budget = total_epoch / (u64)active_users;
-		WRITE_ONCE(user_sched_budget_ns, new_budget);
-		WRITE_ONCE(user_sched_active_users, active_users);
-	} else {
-		WRITE_ONCE(user_sched_budget_ns, 0);
-		WRITE_ONCE(user_sched_active_users, 0);
-	}
 
 	/* Capture per-user epoch_ns for debug BEFORE resetting */
 	{
 		u64 epoch_ns_snapshot[USER_SCHED_MAX_USERS];
+		int wanting_cpu = 0; /* tasks on-rq OR throttled by us */
 
 		for (i = 0; i < n; i++)
 			epoch_ns_snapshot[i] =
@@ -13360,18 +13347,51 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 		for (i = 0; i < n; i++)
 			atomic64_set(&user_sched_table[i].epoch_ns, 0);
 
-		/* Step 3: wake any UID>=1000 tasks throttled to TASK_INTERRUPTIBLE */
+		/*
+		 * Step 3: count tasks wanting CPU and wake throttled ones.
+		 *
+		 * A task "wants CPU" if it is runnable (on_rq) OR if it was
+		 * throttled by our mechanism (TASK_INTERRUPTIBLE + tracked user).
+		 * Counting both ensures we don't turn off enforcement just because
+		 * we already put the excess tasks to sleep this epoch.
+		 *
+		 * Scarcity = wanting_cpu > num_online_cpus().  Without scarcity,
+		 * enforcement is off even if active_users >= 2 — this prevents
+		 * spurious throttling of e.g. 1:1 tasks on 4 CPUs where timing
+		 * jitter could make epoch_ns exceed budget by a millisecond.
+		 */
 		rcu_read_lock();
 		for_each_process_thread(g, p) {
 			uid_t uid = __kuid_val(task_uid(p));
+			long state;
 
-			if (uid >= USER_SCHED_MIN_UID && user_sched_find(uid) &&
-			    (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE)) {
+			if (uid < USER_SCHED_MIN_UID)
+				continue;
+
+			state = READ_ONCE(p->__state);
+			if (p->on_rq == TASK_ON_RQ_QUEUED) {
+				wanting_cpu++;
+			} else if ((state & TASK_INTERRUPTIBLE) &&
+				   user_sched_find(uid)) {
+				/* throttled by us — still wants CPU */
+				wanting_cpu++;
 				if (wake_up_process(p))
 					atomic64_inc(&user_sched_dbg_wakeup);
 			}
 		}
 		rcu_read_unlock();
+
+		/*
+		 * Enable enforcement only when there is real CPU scarcity
+		 * AND at least two distinct users were active this epoch.
+		 */
+		if (active_users >= 2 && wanting_cpu > num_online_cpus()) {
+			WRITE_ONCE(user_sched_budget_ns, new_budget);
+			WRITE_ONCE(user_sched_active_users, active_users);
+		} else {
+			WRITE_ONCE(user_sched_budget_ns, 0);
+			WRITE_ONCE(user_sched_active_users, 0);
+		}
 
 		/*
 		 * Debug: print every 10 epochs (~1 s), AND always print on
