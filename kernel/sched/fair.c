@@ -9285,8 +9285,8 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	 * RB-tree (on_rq=1, cfs_rq->curr=NULL), so deactivate_task() is
 	 * safe to call here with the rq lock held.
 	 */
-	if (entity_is_task(&prev->se) &&
-	    READ_ONCE(user_sched_nr) >= 2) {
+	/* prev is always a task_struct here; no need for entity_is_task check */
+	if (READ_ONCE(user_sched_nr) >= 2) {
 		uid_t uid = __kuid_val(task_uid(prev));
 
 		if (uid >= USER_SCHED_MIN_UID) {
