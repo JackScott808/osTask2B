@@ -13308,13 +13308,13 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 {
 	struct task_struct *g, *p;
 	int i, n;
-	int active_users = 0;   /* users with non-trivial CPU use this epoch */
-	int runnable_count = 0; /* UID>=1000 tasks currently on a run queue */
+	int active_users = 0; /* users with non-trivial CPU use this epoch */
 	u64 total_epoch = 0;
 	u64 new_budget = 0;
+	u64 epoch_num;
 
 	n = atomic_read(&user_sched_nr);
-	atomic64_inc(&user_sched_dbg_epoch);
+	epoch_num = atomic64_inc_return(&user_sched_dbg_epoch);
 
 	/*
 	 * Step 1: count users that were active this epoch and total CPU used.
@@ -13333,44 +13333,14 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 	/*
 	 * Step 2: adaptive budget = total CPU / active users.
 	 * This converges so each active user's CPU time equals the budget.
-	 * Reset epoch counters only after reading them.
+	 *
+	 * No separate scarcity check needed: if tasks == CPUs and users get
+	 * equal time, each user's epoch_ns == budget and the strictly-greater
+	 * throttle condition never fires naturally.  The check is simply
+	 * "were at least two users actually using CPU?"
 	 */
-	if (active_users >= 2)
+	if (active_users >= 2) {
 		new_budget = total_epoch / (u64)active_users;
-
-	for (i = 0; i < n; i++)
-		atomic64_set(&user_sched_table[i].epoch_ns, 0);
-
-	/*
-	 * Step 3: count runnable UID>=1000 tasks and wake sleeping ones.
-	 * We count tasks with on_rq == TASK_ON_RQ_QUEUED (truly runnable,
-	 * not just migrating).  This gives the real scarcity picture without
-	 * the enqueue/dequeue accounting bugs from ENQUEUE_DELAYED paths.
-	 */
-	rcu_read_lock();
-	for_each_process_thread(g, p) {
-		uid_t uid = __kuid_val(task_uid(p));
-
-		if (uid < USER_SCHED_MIN_UID)
-			continue;
-
-		if (p->on_rq == TASK_ON_RQ_QUEUED)
-			runnable_count++;
-
-		if (user_sched_find(uid) &&
-		    (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE)) {
-			if (wake_up_process(p))
-				atomic64_inc(&user_sched_dbg_wakeup);
-		}
-	}
-	rcu_read_unlock();
-
-	/*
-	 * Step 4: enable enforcement only when there is real scarcity.
-	 * Scarcity = more runnable UID>=1000 tasks than CPUs AND at least
-	 * two distinct users were active this epoch.
-	 */
-	if (active_users >= 2 && runnable_count > num_online_cpus()) {
 		WRITE_ONCE(user_sched_budget_ns, new_budget);
 		WRITE_ONCE(user_sched_active_users, active_users);
 	} else {
@@ -13378,14 +13348,38 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 		WRITE_ONCE(user_sched_active_users, 0);
 	}
 
-	/* Debug: one line per epoch to dmesg ring buffer */
-	printk(KERN_DEBUG
-		"user_sched_epoch: n=%d active=%d runnable=%d ncpus=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%lld\n",
-		n, active_users, runnable_count, num_online_cpus(),
-		(unsigned long long)new_budget / 1000000ULL,
-		(long long)atomic64_read(&user_sched_dbg_throttle),
-		(long long)atomic64_read(&user_sched_dbg_wakeup),
-		(long long)atomic64_read(&user_sched_dbg_epoch));
+	/* Reset per-epoch counters */
+	for (i = 0; i < n; i++)
+		atomic64_set(&user_sched_table[i].epoch_ns, 0);
+
+	/* Step 3: wake any UID>=1000 tasks throttled to TASK_INTERRUPTIBLE */
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		uid_t uid = __kuid_val(task_uid(p));
+
+		if (uid >= USER_SCHED_MIN_UID && user_sched_find(uid) &&
+		    (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE)) {
+			if (wake_up_process(p))
+				atomic64_inc(&user_sched_dbg_wakeup);
+		}
+	}
+	rcu_read_unlock();
+
+	/* Debug: one line every 10 epochs (~1 s) to dmesg ring buffer */
+	if (n > 0 && (epoch_num % 10 == 0)) {
+		printk(KERN_DEBUG
+			"user_sched: n=%d active=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%llu\n",
+			n, active_users,
+			(unsigned long long)new_budget / 1000000ULL,
+			(long long)atomic64_read(&user_sched_dbg_throttle),
+			(long long)atomic64_read(&user_sched_dbg_wakeup),
+			(unsigned long long)epoch_num);
+		for (i = 0; i < n; i++)
+			printk(KERN_DEBUG "  uid=%-6u  cpu_time=%lld ms\n",
+			       user_sched_table[i].uid,
+			       (long long)atomic64_read(&user_sched_table[i].cpu_ns)
+				       / 1000000LL);
+	}
 
 	hrtimer_forward_now(timer, ns_to_ktime(USER_SCHED_EPOCH_NS));
 	return HRTIMER_RESTART;
