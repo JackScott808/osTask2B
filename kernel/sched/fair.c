@@ -148,12 +148,17 @@ static struct hrtimer user_sched_hrtimer;
 /*
  * Per-epoch CPU budget per user: updated adaptively after each epoch
  * so that over time each user's CPU time converges to be equal.
- * Initial value = one full epoch (no throttling until we have data).
+ * 0 means no throttling (single active user or no scarcity).
  */
-static u64 user_sched_budget_ns = USER_SCHED_EPOCH_NS;
+static u64 user_sched_budget_ns;
 
-/* Count of runnable UID >= 1000 tasks across the system (for scarcity check) */
-static atomic_t user_sched_total_tasks = ATOMIC_INIT(0);
+/*
+ * Number of users that were active AND there was CPU scarcity last epoch.
+ * 0 = enforcement off (single user or tasks <= CPUs).
+ * Computed fresh every epoch from epoch_ns counters + runnable task count.
+ * Written only from the epoch hrtimer; read lock-free via READ_ONCE.
+ */
+static int user_sched_active_users;
 
 /* Debug counters (readable via dmesg) */
 static atomic64_t user_sched_dbg_throttle = ATOMIC64_INIT(0);
@@ -209,29 +214,24 @@ bool user_sched_should_sleep(struct task_struct *p)
 {
 	uid_t uid = __kuid_val(task_uid(p));
 	struct user_sched_info *uinfo;
-	int n;
+	u64 budget;
 
 	if (uid < USER_SCHED_MIN_UID)
 		return false;
 
-	n = atomic_read(&user_sched_nr);
-	if (n < 2)
-		return false;
-
-	if (atomic_read(&user_sched_total_tasks) <= num_online_cpus())
+	/* user_sched_active_users == 0 means no scarcity / single user */
+	if (READ_ONCE(user_sched_active_users) < 2)
 		return false;
 
 	uinfo = user_sched_find(uid);
 	if (!uinfo)
 		return false;
 
-	{
-		u64 budget = READ_ONCE(user_sched_budget_ns);
+	budget = READ_ONCE(user_sched_budget_ns);
+	if (budget == 0)
+		return false;
 
-		if (budget == 0)
-			return false;
-		return atomic64_read(&uinfo->epoch_ns) > (s64)budget;
-	}
+	return atomic64_read(&uinfo->epoch_ns) > (s64)budget;
 }
 /* ======= End user-fair scheduler declarations ======= */
 
@@ -7136,18 +7136,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 		return;
 	}
 
-	/* Track runnable UID >= 1000 task count for scarcity detection */
-	if (!task_on_rq_migrating(p)) {
-		uid_t _uid = __kuid_val(task_uid(p));
-
-		if (_uid >= USER_SCHED_MIN_UID) {
-			int new_val = atomic_inc_return(&user_sched_total_tasks);
-
-			printk_ratelimited(KERN_DEBUG
-				"user_sched_enqueue: uid=%u total_tasks=%d flags=0x%x\n",
-				_uid, new_val, flags);
-		}
-	}
+	/* (scarcity tracked via per-epoch runnable count in epoch callback) */
 
 	/*
 	 * If in_iowait is set, the code below may not trigger any cpufreq
@@ -7392,24 +7381,7 @@ out:
  */
 static bool dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 {
-	/* Track runnable UID >= 1000 task count for scarcity detection */
-	{
-		uid_t _uid = __kuid_val(task_uid(p));
-
-		if (_uid >= USER_SCHED_MIN_UID && !task_on_rq_migrating(p)) {
-			if (flags & DEQUEUE_SLEEP) {
-				int new_val = atomic_dec_return(&user_sched_total_tasks);
-
-				printk_ratelimited(KERN_DEBUG
-					"user_sched_dequeue_sleep: uid=%u total_tasks=%d flags=0x%x\n",
-					_uid, new_val, flags);
-			} else {
-				printk_ratelimited(KERN_DEBUG
-					"user_sched_dequeue_nosleep: uid=%u total_tasks=%d flags=0x%x (NOT decremented)\n",
-					_uid, atomic_read(&user_sched_total_tasks), flags);
-			}
-		}
-	}
+	/* (scarcity tracked via per-epoch runnable count in epoch callback) */
 
 	if (!(p->se.sched_delayed && (task_on_rq_migrating(p) || (flags & DEQUEUE_SAVE))))
 		util_est_dequeue(&rq->cfs, p);
@@ -13336,60 +13308,84 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 {
 	struct task_struct *g, *p;
 	int i, n;
+	int active_users = 0;   /* users with non-trivial CPU use this epoch */
+	int runnable_count = 0; /* UID>=1000 tasks currently on a run queue */
+	u64 total_epoch = 0;
+	u64 new_budget = 0;
 
 	n = atomic_read(&user_sched_nr);
 	atomic64_inc(&user_sched_dbg_epoch);
 
-	/* Emit debug info every epoch to dmesg ring buffer only */
-	{
-		u64 dbg_budget = READ_ONCE(user_sched_budget_ns);
-		int dbg_total  = atomic_read(&user_sched_total_tasks);
-		int dbg_ncpus  = num_online_cpus();
+	/*
+	 * Step 1: count users that were active this epoch and total CPU used.
+	 * A user is "active" if they consumed > 1ms of CPU (avoids counting
+	 * incidental scheduling noise from users with 0 runnable tasks).
+	 */
+	for (i = 0; i < n; i++) {
+		u64 e = (u64)atomic64_read(&user_sched_table[i].epoch_ns);
 
-		printk(KERN_DEBUG "user_sched_epoch: n=%d total_tasks=%d ncpus=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%lld\n",
-		       n, dbg_total, dbg_ncpus,
-		       (unsigned long long)dbg_budget / 1000000ULL,
-		       (long long)atomic64_read(&user_sched_dbg_throttle),
-		       (long long)atomic64_read(&user_sched_dbg_wakeup),
-		       (long long)atomic64_read(&user_sched_dbg_epoch));
-		for (i = 0; i < n; i++) {
-			printk(KERN_DEBUG "  uid=%-6u  cpu_time=%lld ms  epoch_ns=%lld\n",
-			       user_sched_table[i].uid,
-			       (long long)atomic64_read(&user_sched_table[i].cpu_ns) / 1000000LL,
-			       (long long)atomic64_read(&user_sched_table[i].epoch_ns));
+		if (e > 1000000ULL) { /* > 1 ms */
+			active_users++;
+			total_epoch += e;
 		}
 	}
 
 	/*
-	 * Adaptive budget: set budget for next epoch = total CPU consumed this
-	 * epoch / number of active users.  This converges so that each user's
-	 * CPU time equals the budget, giving them equal CPU shares over time.
+	 * Step 2: adaptive budget = total CPU / active users.
+	 * This converges so each active user's CPU time equals the budget.
+	 * Reset epoch counters only after reading them.
 	 */
-	if (n >= 2) {
-		u64 total = 0;
+	if (active_users >= 2)
+		new_budget = total_epoch / (u64)active_users;
 
-		for (i = 0; i < n; i++)
-			total += (u64)atomic64_read(&user_sched_table[i].epoch_ns);
-		WRITE_ONCE(user_sched_budget_ns, total / (u64)n);
-	}
-
-	/* Reset per-epoch counters */
 	for (i = 0; i < n; i++)
 		atomic64_set(&user_sched_table[i].epoch_ns, 0);
 
-	/* Wake all sleeping tasks from tracked users */
+	/*
+	 * Step 3: count runnable UID>=1000 tasks and wake sleeping ones.
+	 * We count tasks with on_rq == TASK_ON_RQ_QUEUED (truly runnable,
+	 * not just migrating).  This gives the real scarcity picture without
+	 * the enqueue/dequeue accounting bugs from ENQUEUE_DELAYED paths.
+	 */
 	rcu_read_lock();
 	for_each_process_thread(g, p) {
 		uid_t uid = __kuid_val(task_uid(p));
 
-		if (uid >= USER_SCHED_MIN_UID && user_sched_find(uid)) {
-			if (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE) {
-				if (wake_up_process(p))
-					atomic64_inc(&user_sched_dbg_wakeup);
-			}
+		if (uid < USER_SCHED_MIN_UID)
+			continue;
+
+		if (p->on_rq == TASK_ON_RQ_QUEUED)
+			runnable_count++;
+
+		if (user_sched_find(uid) &&
+		    (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE)) {
+			if (wake_up_process(p))
+				atomic64_inc(&user_sched_dbg_wakeup);
 		}
 	}
 	rcu_read_unlock();
+
+	/*
+	 * Step 4: enable enforcement only when there is real scarcity.
+	 * Scarcity = more runnable UID>=1000 tasks than CPUs AND at least
+	 * two distinct users were active this epoch.
+	 */
+	if (active_users >= 2 && runnable_count > num_online_cpus()) {
+		WRITE_ONCE(user_sched_budget_ns, new_budget);
+		WRITE_ONCE(user_sched_active_users, active_users);
+	} else {
+		WRITE_ONCE(user_sched_budget_ns, 0);
+		WRITE_ONCE(user_sched_active_users, 0);
+	}
+
+	/* Debug: one line per epoch to dmesg ring buffer */
+	printk(KERN_DEBUG
+		"user_sched_epoch: n=%d active=%d runnable=%d ncpus=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%lld\n",
+		n, active_users, runnable_count, num_online_cpus(),
+		(unsigned long long)new_budget / 1000000ULL,
+		(long long)atomic64_read(&user_sched_dbg_throttle),
+		(long long)atomic64_read(&user_sched_dbg_wakeup),
+		(long long)atomic64_read(&user_sched_dbg_epoch));
 
 	hrtimer_forward_now(timer, ns_to_ktime(USER_SCHED_EPOCH_NS));
 	return HRTIMER_RESTART;
@@ -13434,8 +13430,7 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	task_tick_core(rq, curr);
 
 	/* User-fairness: throttle over-served users by requesting sleep */
-	if (atomic_read(&user_sched_nr) >= 2 &&
-	    atomic_read(&user_sched_total_tasks) > num_online_cpus()) {
+	if (READ_ONCE(user_sched_active_users) >= 2) {
 		uid_t uid = __kuid_val(task_uid(curr));
 
 		if (uid >= USER_SCHED_MIN_UID) {
@@ -13448,10 +13443,9 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 				    atomic64_read(&uinfo->epoch_ns) > (s64)budget) {
 					atomic64_inc(&user_sched_dbg_throttle);
 					printk_ratelimited(KERN_DEBUG
-						"user_sched_throttle: uid=%u nr=%d total_tasks=%d ncpus=%d budget_ms=%llu epoch_ns=%lld\n",
+						"user_sched_throttle: uid=%u active=%d runnable_last_epoch=%d budget_ms=%llu epoch_ns=%lld\n",
 						uid,
-						atomic_read(&user_sched_nr),
-						atomic_read(&user_sched_total_tasks),
+						READ_ONCE(user_sched_active_users),
 						num_online_cpus(),
 						(unsigned long long)budget / 1000000ULL,
 						(long long)atomic64_read(&uinfo->epoch_ns));
