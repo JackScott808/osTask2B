@@ -13395,8 +13395,9 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 					(unsigned long long)epoch_num,
 					transition ? " [TRANSITION]" : "");
 				for (i = 0; i < n; i++)
+					/* prefix user_sched_u so dmesg grep catches it */
 					printk(KERN_DEBUG
-						"  uid=%-6u  cpu_time=%lld ms  epoch_ns=%llu ms\n",
+						"user_sched_u: uid=%-6u cpu_time_ms=%lld epoch_ns_ms=%llu\n",
 						user_sched_table[i].uid,
 						(long long)atomic64_read(&user_sched_table[i].cpu_ns)
 							/ 1000000LL,
