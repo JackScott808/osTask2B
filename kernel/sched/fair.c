@@ -79,20 +79,30 @@ static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
 const_debug unsigned int sysctl_sched_migration_cost	= 500000UL;
 
 /*
- * Per-user equitable scheduling across users with UID >= 1000.
+ * Per-user equitable CPU scheduling (epoch-based budget).
  *
- * We track total actual CPU time per user and use it to adjust task
- * vruntime at wakeup: under-served users get a vruntime reduction
- * (higher priority), over-served users get an increase (lower priority).
- * At every scheduler tick we also preempt tasks whose user has consumed
- * significantly more than the per-user average.
+ * APPROACH: every USER_SCHED_EPOCH_NS (50 ms) each tracked user gets a
+ * CPU budget of EPOCH / num_users nanoseconds.  When a user exhausts
+ * its budget:
+ *   1. user->throttled is set to 1 and resched_curr() is called.
+ *   2. put_prev_task_fair() sees the throttled flag and puts the task
+ *      to sleep (TASK_INTERRUPTIBLE + deactivate_task).
+ *   3. A global hrtimer fires at the end of the epoch, resets all
+ *      budgets/flags, and calls wake_up_process() on every sleeping
+ *      eligible task.
+ *
+ * "No unnecessary throttling": throttling is skipped when fewer than
+ * two users are being tracked (no inter-user competition).
  */
 #define USER_SCHED_MAX_USERS	256
 #define USER_SCHED_MIN_UID	1000U
+#define USER_SCHED_EPOCH_NS	(50ULL * NSEC_PER_MSEC)  /* 50 ms epoch */
 
 struct user_sched_info {
 	uid_t		uid;
-	atomic64_t	cpu_time;	/* total actual CPU time in nanoseconds */
+	atomic64_t	cpu_time;	 /* total CPU time (ns), lifetime */
+	atomic64_t	epoch_cpu_ns;	 /* CPU time used in current epoch */
+	atomic_t	throttled;	 /* 1 = over budget, tasks sleeping */
 };
 
 static struct user_sched_info user_sched_table[USER_SCHED_MAX_USERS];
@@ -100,16 +110,14 @@ static struct user_sched_info user_sched_table[USER_SCHED_MAX_USERS];
 static unsigned int user_sched_nr;
 static DEFINE_RAW_SPINLOCK(user_sched_lock);
 
+/* Global epoch hrtimer */
+static struct hrtimer user_sched_epoch_hrtimer;
+
 /* ---- Debug counters -------------------------------------------------- */
-/* How many times tick preemption was triggered (resched_curr called)      */
-static atomic64_t user_sched_dbg_preempt  = ATOMIC64_INIT(0);
-/* How many times tick preemption was skipped because h_nr_runnable <= 1   */
-static atomic64_t user_sched_dbg_blk_nr   = ATOMIC64_INIT(0);
-/* How many times tick preemption was skipped because only 1 user tracked  */
-static atomic64_t user_sched_dbg_blk_n    = ATOMIC64_INIT(0);
-/* How many vruntime adjustments were applied in enqueue_entity            */
-static atomic64_t user_sched_dbg_adj      = ATOMIC64_INIT(0);
-/* jiffies timestamp of last periodic dump (CPU0 only)                     */
+static atomic64_t user_sched_dbg_throttle_events = ATOMIC64_INIT(0);
+static atomic64_t user_sched_dbg_sleep_events    = ATOMIC64_INIT(0);
+static atomic64_t user_sched_dbg_wake_events     = ATOMIC64_INIT(0);
+static atomic64_t user_sched_dbg_epoch_resets    = ATOMIC64_INIT(0);
 static unsigned long user_sched_dbg_last_j;
 
 /* Called from CPU 0's scheduler tick roughly once per second. */
@@ -120,14 +128,20 @@ static void user_sched_dump(void)
 	pr_info("user_sched_dbg: %u user(s) tracked\n", n);
 	for (i = 0; i < n; i++) {
 		u64 t = (u64)atomic64_read(&user_sched_table[i].cpu_time);
-		pr_info("  uid=%-6u  cpu_time=%llu ms\n",
-			user_sched_table[i].uid, t / (u64)NSEC_PER_MSEC);
+		u64 e = (u64)atomic64_read(&user_sched_table[i].epoch_cpu_ns);
+
+		pr_info("  uid=%-6u  cpu_time=%llu ms  epoch_used=%llu us  throttled=%d\n",
+			user_sched_table[i].uid,
+			t / (u64)NSEC_PER_MSEC,
+			e / (u64)NSEC_PER_USEC,
+			atomic_read(&user_sched_table[i].throttled));
 	}
-	pr_info("  preempt_triggered=%lld  blk_h_nr=%lld  blk_n=%lld  adj=%lld\n",
-		(long long)atomic64_read(&user_sched_dbg_preempt),
-		(long long)atomic64_read(&user_sched_dbg_blk_nr),
-		(long long)atomic64_read(&user_sched_dbg_blk_n),
-		(long long)atomic64_read(&user_sched_dbg_adj));
+	pr_info("  throttle_events=%lld  sleep_events=%lld"
+		"  wake_events=%lld  epoch_resets=%lld\n",
+		(long long)atomic64_read(&user_sched_dbg_throttle_events),
+		(long long)atomic64_read(&user_sched_dbg_sleep_events),
+		(long long)atomic64_read(&user_sched_dbg_wake_events),
+		(long long)atomic64_read(&user_sched_dbg_epoch_resets));
 }
 /* ---- End debug counters ---------------------------------------------- */
 
@@ -166,6 +180,8 @@ static struct user_sched_info *user_sched_get(uid_t uid)
 			info = &user_sched_table[n];
 			info->uid = uid;
 			atomic64_set(&info->cpu_time, 0);
+			atomic64_set(&info->epoch_cpu_ns, 0);
+			atomic_set(&info->throttled, 0);
 			/* uid must be visible before nr is incremented. */
 			smp_wmb();
 			WRITE_ONCE(user_sched_nr, n + 1);
@@ -174,6 +190,57 @@ static struct user_sched_info *user_sched_get(uid_t uid)
 	raw_spin_unlock_irqrestore(&user_sched_lock, flags);
 	return info;
 }
+
+/*
+ * Epoch hrtimer callback: fires every USER_SCHED_EPOCH_NS.
+ * Resets per-user epoch budgets and throttle flags, then wakes any
+ * tasks that were put to sleep by put_prev_task_fair().
+ */
+static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
+{
+	struct task_struct *g, *p;
+	unsigned int i, n = READ_ONCE(user_sched_nr);
+
+	atomic64_inc(&user_sched_dbg_epoch_resets);
+
+	/* Reset epoch state for all tracked users */
+	for (i = 0; i < n; i++) {
+		atomic64_set(&user_sched_table[i].epoch_cpu_ns, 0);
+		atomic_set(&user_sched_table[i].throttled, 0);
+	}
+
+	/*
+	 * Wake any tasks that were sleeping because their user was throttled.
+	 * wake_up_process() is a no-op for already-running tasks.
+	 */
+	rcu_read_lock();
+	for_each_process_thread(g, p) {
+		uid_t uid = __kuid_val(task_uid(p));
+
+		if (uid >= USER_SCHED_MIN_UID) {
+			if (wake_up_process(p))
+				atomic64_inc(&user_sched_dbg_wake_events);
+		}
+	}
+	rcu_read_unlock();
+
+	hrtimer_forward_now(timer, ns_to_ktime(USER_SCHED_EPOCH_NS));
+	return HRTIMER_RESTART;
+}
+
+static int __init user_sched_init(void)
+{
+	hrtimer_init(&user_sched_epoch_hrtimer, CLOCK_MONOTONIC,
+		     HRTIMER_MODE_REL);
+	user_sched_epoch_hrtimer.function = user_sched_epoch_fn;
+	hrtimer_start(&user_sched_epoch_hrtimer,
+		      ns_to_ktime(USER_SCHED_EPOCH_NS),
+		      HRTIMER_MODE_REL);
+	pr_info("user_sched: epoch-based fair scheduling active (epoch=%llu ms)\n",
+		USER_SCHED_EPOCH_NS / NSEC_PER_MSEC);
+	return 0;
+}
+late_initcall(user_sched_init);
 
 static int __init setup_sched_thermal_decay_shift(char *str)
 {
@@ -1333,17 +1400,35 @@ static void update_curr(struct cfs_rq *cfs_rq)
 		if (dl_server_active(&rq->fair_server))
 			dl_server_update(&rq->fair_server, delta_exec);
 
-		/* Per-user CPU time accounting for equitable scheduling. */
+		/* Per-user CPU time accounting + epoch budget enforcement. */
 		{
 			uid_t uid = __kuid_val(task_uid(p));
 
 			if (uid >= USER_SCHED_MIN_UID) {
 				struct user_sched_info *uinfo = user_sched_find(uid);
 
-				if (likely(uinfo))
+				if (likely(uinfo)) {
+					unsigned int n;
+					u64 epoch_used;
+					u64 budget;
+
 					atomic64_add(delta_exec, &uinfo->cpu_time);
-				else
+					atomic64_add(delta_exec, &uinfo->epoch_cpu_ns);
+
+					n = READ_ONCE(user_sched_nr);
+					if (n >= 2 && !atomic_read(&uinfo->throttled)) {
+						epoch_used = (u64)atomic64_read(
+							&uinfo->epoch_cpu_ns);
+						budget = USER_SCHED_EPOCH_NS / n;
+						if (epoch_used >= budget) {
+							atomic_set(&uinfo->throttled, 1);
+							atomic64_inc(&user_sched_dbg_throttle_events);
+							resched_curr(rq_of(cfs_rq));
+						}
+					}
+				} else {
 					user_sched_get(uid); /* lazy first registration */
+				}
 			}
 		}
 	}
@@ -5535,61 +5620,6 @@ enqueue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
 	check_schedstat_required();
 	update_stats_enqueue_fair(cfs_rq, se, flags);
 
-	/*
-	 * Per-user vruntime adjustment for equitable scheduling.
-	 *
-	 * When a non-running task is about to be inserted into the RB-tree,
-	 * bias its vruntime (and deadline) to reflect the user-level CPU
-	 * debt/surplus relative to the per-user average.  A user who has
-	 * consumed less CPU than average gets a negative offset (higher
-	 * priority); a user who has consumed more gets a positive one.
-	 *
-	 * Only applies to:
-	 *  - leaf task entities (not group scheduling entities)
-	 *  - users with UID >= USER_SCHED_MIN_UID
-	 *  - when at least two such users are being tracked (contention)
-	 */
-	if (!curr && entity_is_task(se)) {
-		uid_t uid = __kuid_val(task_uid(task_of(se)));
-
-		if (uid >= USER_SCHED_MIN_UID) {
-			unsigned int n = READ_ONCE(user_sched_nr);
-
-			if (n > 1) {
-				struct user_sched_info *uinfo;
-				u64 total = 0;
-				int i;
-
-				for (i = 0; i < (int)n; i++)
-					total += (u64)atomic64_read(&user_sched_table[i].cpu_time);
-
-				uinfo = user_sched_find(uid);
-				if (uinfo) {
-					u64 avg_time = div_u64(total, n);
-					u64 user_time = (u64)atomic64_read(&uinfo->cpu_time);
-					/*
-					 * deficit > 0: user is under-served → reduce
-					 * vruntime to boost priority.
-					 * deficit < 0: user is over-served → increase
-					 * vruntime to lower priority.
-					 * Clamp to ±500 ms to avoid extreme jumps.
-					 */
-					s64 deficit = (s64)avg_time - (s64)user_time;
-					s64 max_adj = (s64)(500 * NSEC_PER_MSEC);
-
-					if (deficit > max_adj)
-						deficit = max_adj;
-					else if (deficit < -max_adj)
-						deficit = -max_adj;
-
-					se->vruntime -= deficit;
-					se->deadline  -= deficit;
-					atomic64_inc(&user_sched_dbg_adj);
-				}
-			}
-		}
-	}
-
 	if (!curr)
 		__enqueue_entity(cfs_rq, se);
 	se->on_rq = 1;
@@ -9244,6 +9274,31 @@ static void put_prev_task_fair(struct rq *rq, struct task_struct *prev, struct t
 	for_each_sched_entity(se) {
 		cfs_rq = cfs_rq_of(se);
 		put_prev_entity(cfs_rq, se);
+	}
+
+	/*
+	 * Per-user throttling: if this user has exhausted its epoch CPU
+	 * budget, put the task to sleep until the epoch hrtimer resets
+	 * the budget and calls wake_up_process().
+	 *
+	 * put_prev_entity() above has already re-enqueued the task in the
+	 * RB-tree (on_rq=1, cfs_rq->curr=NULL), so deactivate_task() is
+	 * safe to call here with the rq lock held.
+	 */
+	if (entity_is_task(&prev->se) &&
+	    READ_ONCE(user_sched_nr) >= 2) {
+		uid_t uid = __kuid_val(task_uid(prev));
+
+		if (uid >= USER_SCHED_MIN_UID) {
+			struct user_sched_info *uinfo = user_sched_find(uid);
+
+			if (uinfo && atomic_read(&uinfo->throttled)) {
+				atomic64_inc(&user_sched_dbg_sleep_events);
+				WRITE_ONCE(prev->__state, TASK_INTERRUPTIBLE);
+				deactivate_task(rq, prev,
+						DEQUEUE_SLEEP | DEQUEUE_NOCLOCK);
+			}
+		}
 	}
 }
 
@@ -13370,65 +13425,13 @@ static void task_tick_fair(struct rq *rq, struct task_struct *curr, int queued)
 	update_misfit_status(curr, rq);
 	check_update_overutilized_status(task_rq(curr));
 
-	/*
-	 * Per-user equitable scheduling: preempt an over-served user.
-	 *
-	 * If the currently running task's user has consumed significantly
-	 * more CPU than the per-user average AND there are multiple
-	 * runnable tasks on this CPU, trigger a reschedule so that a task
-	 * belonging to an under-served user can run sooner.
-	 *
-	 * "No unnecessary throttling": skip when h_nr_runnable <= 1 (no
-	 * competition) or when fewer tracked users exist than 2.
-	 */
-	{
-		uid_t uid = __kuid_val(task_uid(curr));
+	/* Periodic debug dump from CPU 0, roughly once per second. */
+	if (raw_smp_processor_id() == 0) {
+		unsigned long now = jiffies;
 
-		if (uid >= USER_SCHED_MIN_UID) {
-			unsigned int n = READ_ONCE(user_sched_nr);
-
-			if (n <= 1) {
-				/* Only one tracked user: nothing to enforce */
-				atomic64_inc(&user_sched_dbg_blk_n);
-			} else if (rq->cfs.h_nr_runnable <= 1) {
-				/* No local competition on this CPU */
-				atomic64_inc(&user_sched_dbg_blk_nr);
-			} else {
-				struct user_sched_info *uinfo = user_sched_find(uid);
-
-				if (uinfo) {
-					u64 total = 0;
-					u64 user_time, avg_time;
-					int i;
-
-					for (i = 0; i < (int)n; i++)
-						total += (u64)atomic64_read(
-							&user_sched_table[i].cpu_time);
-
-					avg_time  = div_u64(total, n);
-					user_time = (u64)atomic64_read(&uinfo->cpu_time);
-
-					/*
-					 * Preempt if this user has gotten more
-					 * than 150 % of the per-user average.
-					 */
-					if (avg_time > 0 &&
-					    user_time > avg_time + (avg_time >> 1)) {
-						atomic64_inc(&user_sched_dbg_preempt);
-						resched_curr(rq);
-					}
-				}
-			}
-		}
-
-		/* Periodic debug dump from CPU 0, roughly once per second. */
-		if (raw_smp_processor_id() == 0) {
-			unsigned long now = jiffies;
-
-			if (time_after(now, user_sched_dbg_last_j + HZ)) {
-				user_sched_dbg_last_j = now;
-				user_sched_dump();
-			}
+		if (time_after(now, user_sched_dbg_last_j + HZ)) {
+			user_sched_dbg_last_j = now;
+			user_sched_dump();
 		}
 	}
 
