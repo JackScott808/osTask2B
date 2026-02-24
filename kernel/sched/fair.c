@@ -13348,37 +13348,61 @@ static enum hrtimer_restart user_sched_epoch_fn(struct hrtimer *timer)
 		WRITE_ONCE(user_sched_active_users, 0);
 	}
 
-	/* Reset per-epoch counters */
-	for (i = 0; i < n; i++)
-		atomic64_set(&user_sched_table[i].epoch_ns, 0);
+	/* Capture per-user epoch_ns for debug BEFORE resetting */
+	{
+		u64 epoch_ns_snapshot[USER_SCHED_MAX_USERS];
 
-	/* Step 3: wake any UID>=1000 tasks throttled to TASK_INTERRUPTIBLE */
-	rcu_read_lock();
-	for_each_process_thread(g, p) {
-		uid_t uid = __kuid_val(task_uid(p));
-
-		if (uid >= USER_SCHED_MIN_UID && user_sched_find(uid) &&
-		    (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE)) {
-			if (wake_up_process(p))
-				atomic64_inc(&user_sched_dbg_wakeup);
-		}
-	}
-	rcu_read_unlock();
-
-	/* Debug: one line every 10 epochs (~1 s) to dmesg ring buffer */
-	if (n > 0 && (epoch_num % 10 == 0)) {
-		printk(KERN_DEBUG
-			"user_sched: n=%d active=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%llu\n",
-			n, active_users,
-			(unsigned long long)new_budget / 1000000ULL,
-			(long long)atomic64_read(&user_sched_dbg_throttle),
-			(long long)atomic64_read(&user_sched_dbg_wakeup),
-			(unsigned long long)epoch_num);
 		for (i = 0; i < n; i++)
-			printk(KERN_DEBUG "  uid=%-6u  cpu_time=%lld ms\n",
-			       user_sched_table[i].uid,
-			       (long long)atomic64_read(&user_sched_table[i].cpu_ns)
-				       / 1000000LL);
+			epoch_ns_snapshot[i] =
+				(u64)atomic64_read(&user_sched_table[i].epoch_ns);
+
+		/* Reset per-epoch counters */
+		for (i = 0; i < n; i++)
+			atomic64_set(&user_sched_table[i].epoch_ns, 0);
+
+		/* Step 3: wake any UID>=1000 tasks throttled to TASK_INTERRUPTIBLE */
+		rcu_read_lock();
+		for_each_process_thread(g, p) {
+			uid_t uid = __kuid_val(task_uid(p));
+
+			if (uid >= USER_SCHED_MIN_UID && user_sched_find(uid) &&
+			    (READ_ONCE(p->__state) & TASK_INTERRUPTIBLE)) {
+				if (wake_up_process(p))
+					atomic64_inc(&user_sched_dbg_wakeup);
+			}
+		}
+		rcu_read_unlock();
+
+		/*
+		 * Debug: print every 10 epochs (~1 s), AND always print on
+		 * active_users transitions so we can see exactly when
+		 * enforcement turns on/off and what the initial budget is.
+		 */
+		{
+			static int prev_active_users;
+			int transition = (active_users != prev_active_users);
+
+			if (transition)
+				prev_active_users = active_users;
+
+			if (n > 0 && (transition || epoch_num % 10 == 0)) {
+				printk(KERN_DEBUG
+					"user_sched: n=%d active=%d budget_ms=%llu throttle=%lld wakeup=%lld epoch=%llu%s\n",
+					n, active_users,
+					(unsigned long long)new_budget / 1000000ULL,
+					(long long)atomic64_read(&user_sched_dbg_throttle),
+					(long long)atomic64_read(&user_sched_dbg_wakeup),
+					(unsigned long long)epoch_num,
+					transition ? " [TRANSITION]" : "");
+				for (i = 0; i < n; i++)
+					printk(KERN_DEBUG
+						"  uid=%-6u  cpu_time=%lld ms  epoch_ns=%llu ms\n",
+						user_sched_table[i].uid,
+						(long long)atomic64_read(&user_sched_table[i].cpu_ns)
+							/ 1000000LL,
+						epoch_ns_snapshot[i] / 1000000ULL);
+			}
+		}
 	}
 
 	hrtimer_forward_now(timer, ns_to_ktime(USER_SCHED_EPOCH_NS));
